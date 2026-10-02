@@ -28,8 +28,24 @@
 #include "evntrace.h"
 
 #include "wine/debug.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(eventlog);
+
+/* iOS-Madeira: a real-time consumer that is never sent an event. ProcessTrace
+ * blocks on it until CloseTrace, as on Windows when nothing is logged, so a
+ * program that runs its consumer on a thread of its own (Steam's client
+ * service) does not see that thread end at once and give up. */
+struct consumer
+{
+    struct list entry;
+    TRACEHANDLE handle;
+    HANDLE closed;
+};
+
+static struct list consumers = LIST_INIT( consumers );
+static SRWLOCK consumers_lock = SRWLOCK_INIT;
+static TRACEHANDLE next_consumer = 1;
 
 /******************************************************************************
  *     ControlTraceA   (sechost.@)
@@ -122,10 +138,30 @@ ULONG WINAPI StopTraceW( TRACEHANDLE handle, const WCHAR *session, EVENT_TRACE_P
 TRACEHANDLE WINAPI OpenTraceW( EVENT_TRACE_LOGFILEW *logfile )
 {
     static int once;
+    struct consumer *consumer;
+    TRACEHANDLE handle;
 
     if (!once++) FIXME("%p: stub\n", logfile);
-    SetLastError(ERROR_ACCESS_DENIED);
-    return INVALID_PROCESSTRACE_HANDLE;
+
+    /* only the leading fields are read: the rest of Wine's EVENT_TRACE_LOGFILEW
+     * lacks BuffersRead, so its LogFileMode is not the caller's */
+    if (!logfile || !logfile->LoggerName || logfile->LogFileName ||
+        !(consumer = malloc( sizeof(*consumer) )))
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (!(consumer->closed = CreateEventW( NULL, TRUE, FALSE, NULL )))
+    {
+        free( consumer );
+        return INVALID_PROCESSTRACE_HANDLE;
+    }
+
+    AcquireSRWLockExclusive( &consumers_lock );
+    handle = consumer->handle = next_consumer++;
+    list_add_tail( &consumers, &consumer->entry );
+    ReleaseSRWLockExclusive( &consumers_lock );
+    return handle;
 }
 
 /******************************************************************************
@@ -133,8 +169,30 @@ TRACEHANDLE WINAPI OpenTraceW( EVENT_TRACE_LOGFILEW *logfile )
  */
 ULONG WINAPI ProcessTrace( TRACEHANDLE *handles, ULONG count, FILETIME *start_time, FILETIME *end_time )
 {
+    HANDLE events[MAXIMUM_WAIT_OBJECTS];
+    struct consumer *consumer;
+    ULONG ret, found = 0;
+
     FIXME("%p %lu %p %p: stub\n", handles, count, start_time, end_time);
-    return ERROR_CALL_NOT_IMPLEMENTED;
+
+    if (!handles || !count || count > ARRAY_SIZE(events)) return ERROR_INVALID_PARAMETER;
+
+    AcquireSRWLockShared( &consumers_lock );
+    while (found < count)
+    {
+        LIST_FOR_EACH_ENTRY( consumer, &consumers, struct consumer, entry )
+            if (consumer->handle == handles[found]) break;
+        if (&consumer->entry == &consumers ||
+            !DuplicateHandle( GetCurrentProcess(), consumer->closed, GetCurrentProcess(),
+                              &events[found], 0, FALSE, DUPLICATE_SAME_ACCESS )) break;
+        found++;
+    }
+    ReleaseSRWLockShared( &consumers_lock );
+
+    ret = found == count ? ERROR_SUCCESS : ERROR_CALL_NOT_IMPLEMENTED;
+    if (!ret) WaitForMultipleObjects( count, events, TRUE, INFINITE );
+    while (found) CloseHandle( events[--found] );
+    return ret;
 }
 
 /******************************************************************************
@@ -142,7 +200,22 @@ ULONG WINAPI ProcessTrace( TRACEHANDLE *handles, ULONG count, FILETIME *start_ti
  */
 ULONG WINAPI CloseTrace( TRACEHANDLE handle )
 {
+    struct consumer *consumer;
+
     FIXME("%s: stub\n", wine_dbgstr_longlong(handle));
+
+    AcquireSRWLockExclusive( &consumers_lock );
+    LIST_FOR_EACH_ENTRY( consumer, &consumers, struct consumer, entry )
+    {
+        if (consumer->handle != handle) continue;
+        list_remove( &consumer->entry );
+        ReleaseSRWLockExclusive( &consumers_lock );
+        SetEvent( consumer->closed );
+        CloseHandle( consumer->closed );
+        free( consumer );
+        return ERROR_SUCCESS;
+    }
+    ReleaseSRWLockExclusive( &consumers_lock );
     return ERROR_INVALID_HANDLE;
 }
 

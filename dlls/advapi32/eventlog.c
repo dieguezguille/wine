@@ -714,11 +714,16 @@ ULONG WINAPI QueryTraceW( TRACEHANDLE handle, LPCWSTR sessionname, PEVENT_TRACE_
  */
 TRACEHANDLE WINAPI OpenTraceA( PEVENT_TRACE_LOGFILEA logfile )
 {
-    static int once;
+    EVENT_TRACE_LOGFILEW logfileW = {0};
+    TRACEHANDLE ret;
 
-    if (!once++) FIXME("%p: stub\n", logfile);
-    SetLastError(ERROR_ACCESS_DENIED);
-    return INVALID_PROCESSTRACE_HANDLE;
+    if (!logfile) return OpenTraceW( NULL );
+    logfileW.LogFileName = strdupAW( logfile->LogFileName );
+    logfileW.LoggerName = strdupAW( logfile->LoggerName );
+    ret = OpenTraceW( &logfileW );
+    free( logfileW.LogFileName );
+    free( logfileW.LoggerName );
+    return ret;
 }
 
 /******************************************************************************
