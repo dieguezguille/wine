@@ -1048,15 +1048,38 @@ found:
 
     if (!environment && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &token))
     {
-        WCHAR val[16];
-        CreateEnvironmentBlock(&environment, token, FALSE);
-        if (GetEnvironmentVariableW( L"WINEBOOTSTRAPMODE", val, ARRAY_SIZE(val) ))
+        /* iOS-Madeira: the FEX modules read the JIT pool layout and their whole
+         * configuration (FEX_*) from the environment, and a 32-bit service
+         * (Steam's SteamService.exe) aborts without the pool layout. The block
+         * below is built from the registry only, so they have to be carried over. */
+        static const WCHAR *inherited[] =
         {
-            UNICODE_STRING name = RTL_CONSTANT_STRING(L"WINEBOOTSTRAPMODE");
-            UNICODE_STRING value;
+            L"WINEBOOTSTRAPMODE",
+            L"WINE_IOS_JIT_RX",
+            L"WINE_IOS_JIT_RW",
+            L"WINE_IOS_JIT_SIZE",
+        };
+        WCHAR *strings, *ptr, *eq;
+        DWORD i;
 
-            RtlInitUnicodeString( &value, val );
-            RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+        CreateEnvironmentBlock(&environment, token, FALSE);
+        if ((strings = GetEnvironmentStringsW()))
+        {
+            for (ptr = strings; *ptr; ptr += wcslen( ptr ) + 1)
+            {
+                UNICODE_STRING name, value;
+
+                if (!(eq = wcschr( ptr + 1, '=' ))) continue;
+                name.Buffer = ptr;
+                name.Length = name.MaximumLength = (eq - ptr) * sizeof(WCHAR);
+                for (i = 0; i < ARRAY_SIZE(inherited); i++)
+                    if (name.Length == wcslen( inherited[i] ) * sizeof(WCHAR) &&
+                        !wcsnicmp( ptr, inherited[i], eq - ptr )) break;
+                if (i == ARRAY_SIZE(inherited) && wcsnicmp( ptr, L"FEX_", 4 )) continue;
+                RtlInitUnicodeString( &value, eq + 1 );
+                RtlSetEnvironmentVariable( (WCHAR **)&environment, &name, &value );
+            }
+            FreeEnvironmentStringsW( strings );
         }
         CloseHandle(token);
     }
